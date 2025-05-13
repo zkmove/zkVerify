@@ -26,6 +26,10 @@ hex-literal = { workspace = true, optional = true }
 native = { workspace = true }
 sp-io = { workspace = true }
 halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v0.3.0" }
+vm-circuit = { path = "../../../zkmove-vm/vm-circuit"}
+types = { path = "../../../zkmove-vm/common/types" }
+move-package = { git = "https://github.com/zkmove/aptos-core", rev = "59647fda5" }
+anyhow = "1.0.38"
 rand = { version = "0.8" }
 educe = { version = "0.6.0", default-features = false, features = [
 	"Clone",

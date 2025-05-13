@@ -1,11 +1,11 @@
 #![cfg(test)]
 
 use super::*;
-use crate::test_circuit::get_test_circuit;
+use crate::utils::prepare_test_circuit;
 use halo2_proofs::halo2curves::bn256::Fr;
-use halo2_proofs::halo2curves::ff::PrimeField;
 use halo2_proofs::SerdeFormat;
 use serial_test::serial;
+use vm_circuit::{prove_circuit, setup_circuit};
 
 struct MockRuntime;
 impl Config for MockRuntime {
@@ -14,28 +14,18 @@ impl Config for MockRuntime {
 
 #[test]
 #[serial]
-fn verify_simple_proof() {
-    let (circuit, instances) = get_test_circuit::<Fr>();
-    let params = load_params(4).expect("Failed to load params");
-    let (vk, pk) = proofs::setup_circuit(&circuit, &params).expect("Failed to setup circuit");
-    let proof = proofs::prove_circuit(circuit, &[&instances], &params, pk)
-        .expect("Failed to generate Proof");
+fn verify_proof() {
+    let (circuit, instances, k) = prepare_test_circuit::<Fr>().expect("Failed to get VM circuit");
+    let params = load_params(k).expect("Failed to load params");
+    let (vk, pk) = setup_circuit(&circuit, &params).expect("Failed to setup circuit");
+    let proof = prove_circuit(circuit, &instances.as_ref(), &params, &pk)
+        .expect("proof generation should not fail");
 
     let vk_bytes = vk.to_bytes(SerdeFormat::Processed);
+    let vk = Vk::new(vk_bytes, CircuitType::ZkMove, k);
+    let pubs = instances.to_bytes();
 
-    let vk = Vk::new(vk_bytes);
-    let pi = instances
-        .into_iter()
-        .map(|i| {
-            let mut bytes = i.to_repr().as_ref().to_vec();
-            bytes.resize(PUBS_SIZE, 0);
-            bytes
-                .try_into()
-                .expect("Failed to convert instance to PUBS_SIZE array")
-        })
-        .collect();
-
-    let result = Halo2::<MockRuntime>::verify_proof(&vk, &proof, &pi);
+    let result = Halo2::<MockRuntime>::verify_proof(&vk, &proof, &pubs);
     assert!(
         result.is_ok(),
         "Valid proof verification failed: {:?}",

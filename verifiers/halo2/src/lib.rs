@@ -1,8 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use crate::test_circuit::{get_test_circuit, TestCircuit};
+use ::vm_circuit::circuit_v2::VmCircuit;
 use codec::{Decode, Encode, MaxEncodedLen};
-use educe::Educe;
 use frame_support::pallet_prelude::TypeInfo;
 use frame_support::{ensure, weights::Weight};
 use halo2_proofs::SerdeFormat;
@@ -14,26 +13,40 @@ use halo2_proofs::{
 use hp_verifiers::{Cow, Verifier, VerifyError};
 use sp_core::{Get, H256};
 use sp_std::{marker::PhantomData, vec::Vec};
+use vm_circuit::{verify_circuit, InstanceFields, NUM_INSTANCE_COLUMNS};
 
-pub const PUBS_SIZE: usize = 32;
+pub const PUBS_SIZE: usize = 1024;
 pub const VK_SIZE: usize = 1024;
 
 pub type Proof = Vec<u8>;
-pub type Pubs = Vec<[u8; PUBS_SIZE]>;
+pub type Pubs = Vec<u8>;
 
-#[derive(Educe, Encode, Decode, TypeInfo)]
-#[educe(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode, TypeInfo)]
+pub enum CircuitType {
+    ZkMove,
+}
+#[derive(Clone, Debug, PartialEq, Encode, Decode, TypeInfo)]
 pub struct Vk {
     pub vk: Vec<u8>,
+    pub circuit: CircuitType,
+    pub k: u32,
 }
 
 impl Vk {
-    pub fn new(vk: Vec<u8>) -> Self {
-        Vk { vk }
+    pub fn new(vk: Vec<u8>, circuit: CircuitType, k: u32) -> Self {
+        Vk { vk, circuit, k }
     }
 
     pub fn get_vk(&self) -> &Vec<u8> {
         &self.vk
+    }
+
+    pub fn circuit(&self) -> &CircuitType {
+        &self.circuit
+    }
+
+    pub fn get_k(&self) -> u32 {
+        self.k
     }
 }
 
@@ -43,8 +56,7 @@ impl MaxEncodedLen for Vk {
     }
 }
 
-mod proofs;
-mod test_circuit;
+mod utils;
 pub(crate) mod verifier_should;
 mod weight;
 
@@ -70,43 +82,22 @@ impl<T: Config> Verifier for Halo2<T> {
         pubs: &Self::Pubs,
     ) -> Result<Option<Weight>, VerifyError> {
         log::trace!("Verifying Halo2 proof");
-        let params = load_params(4).expect("Failed to load params");
+        // ensure!(
+        //     pubs.len() <= T::MaxPubs::get() as usize,
+        //     VerifyError::InvalidInput
+        // );
 
-        ensure!(
-            pubs.len() <= T::MaxPubs::get() as usize,
-            VerifyError::InvalidInput
-        );
-
-        let vk_deserialized = deserialize_vk(&vk.get_vk())?;
-
-        let instances: Vec<Fr> = pubs
-            .iter()
-            .map(|pub_bytes| {
-                let mut fr_bytes = [0u8; 32];
-                fr_bytes.copy_from_slice(pub_bytes);
-                let fr_opt = Fr::from_bytes(&fr_bytes);
-                if fr_opt.is_some().into() {
-                    Ok(fr_opt.unwrap())
-                } else {
-                    Err(VerifyError::InvalidInput)
-                }
-            })
-            .collect::<Result<Vec<_>, VerifyError>>()?;
-        let instances_refs: Vec<&[Fr]> =
-            instances.iter().map(|v| std::slice::from_ref(v)).collect();
-
-        proofs::verify_circuit(&instances_refs, &params, &vk_deserialized, proof.clone()).map_err(
-            |e| {
-                log::debug!("Cannot verify proof: {:?}", e);
-                VerifyError::VerifyError
-            },
-        )?;
+        let params = load_params(vk.get_k()).expect("Failed to load params");
+        let vk = deserialize_vk(vk)?;
+        let instances = InstanceFields::<Fr, NUM_INSTANCE_COLUMNS>::from_bytes(pubs);
+        verify_circuit(&instances.as_ref(), &params, &vk, proof)
+            .expect("verify proof should be ok");
 
         Ok(None)
     }
 
     fn validate_vk(vk: &Self::Vk) -> Result<(), VerifyError> {
-        deserialize_vk(vk.get_vk())
+        deserialize_vk(vk)
             .map(|_| ())
             .map_err(|_| VerifyError::InvalidVerificationKey)?;
         Ok(())
@@ -117,30 +108,31 @@ impl<T: Config> Verifier for Halo2<T> {
     }
 
     fn vk_bytes(vk: &Self::Vk) -> Cow<[u8]> {
-        Cow::Borrowed(vk.get_vk())
+        Cow::Borrowed(vk.get_vk()) //we don't need to hash the whole vk
     }
 
     fn pubs_bytes(pubs: &Self::Pubs) -> Cow<[u8]> {
-        let data = pubs
-            .iter()
-            .flat_map(|s| s.iter().cloned())
-            .collect::<Vec<_>>();
-        Cow::Owned(data)
+        Cow::Borrowed(pubs)
     }
 }
 
-fn deserialize_vk(vk: &[u8]) -> Result<VerifyingKey<G1Affine>, VerifyError> {
-    VerifyingKey::<G1Affine>::from_bytes::<TestCircuit<Fr>>(vk, SerdeFormat::Processed).map_err(
-        |e| {
-            log::debug!("VK deserialization failed: {:?}", e);
-            VerifyError::InvalidVerificationKey
-        },
-    )
+fn deserialize_vk(vk: &Vk) -> Result<VerifyingKey<G1Affine>, VerifyError> {
+    match vk.circuit() {
+        CircuitType::ZkMove => {
+            VerifyingKey::<G1Affine>::from_bytes::<VmCircuit<Fr>>(vk.get_vk(), SerdeFormat::Processed)
+                .map_err(|e| {
+                    log::debug!("VK deserialization failed: {:?}", e);
+                    VerifyError::InvalidVerificationKey
+                })
+        }
+    }
 }
 
 #[cfg(feature = "std")]
 fn load_params(k: u32) -> Result<ParamsKZG<Bn256>, VerifyError> {
-    let params = ParamsKZG::<Bn256>::new(k);
+    //TODO: load params from file or chain
+    let rng = rand::rngs::mock::StepRng::new(0, 1);
+    let params = ParamsKZG::<Bn256>::setup(k, rng);
     Ok(params)
 }
 
